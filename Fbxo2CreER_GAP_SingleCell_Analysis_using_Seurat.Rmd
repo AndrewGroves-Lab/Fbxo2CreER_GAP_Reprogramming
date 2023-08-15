@@ -1,0 +1,142 @@
+---
+title: "Fbxo2CreER_GAP_analysis"
+author: "Ishwar Hosamani"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+All the code and parameters used to analyze the single cell data from the Fbxo2CreER x GAP experiments is provided below:
+
+```{r Import libraries}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(biomaRt)
+library(grDevices)
+library(cowplot)
+library(clustree)
+library(ggplot2)
+library(SeuratDisk)
+library(scCustomize)
+library(EnhancedVolcano)
+library(viridis)
+library(reticulate)
+```
+
+
+```{r Import and clean up data}
+rm(list=ls())
+# setwd()
+exon_df = read.table('../Exon_UMI_matrix_032222_withSox2.txt.gz', header = T, sep = '\t',
+                     row.names = 1, as.is = T)
+exon_df_duplicates <- exon_df[duplicated(exon_df$gene_symbol),] #list of duplicate genes. Question? Why and how do these occur?
+dim(exon_df_duplicates)
+
+exon_df = exon_df[!duplicated(exon_df$gene_symbol),] #remove the duplicate genes, makes sure only unique entries are retained
+dim(exon_df) # 48321  361
+exon_mat = as.matrix(exon_df[, 2:361]) #removes the column "gene_symbol" and forces the dataframe to be matrix
+gene_list = rownames(exon_mat)
+exon_total_umi = colSums(exon_mat)
+rownames(exon_mat) = exon_df[gene_list, 'gene_symbol'] #sets the rownames to gene_symbols 
+
+```
+
+```{r Seurat analysis}
+# Create Seurat Object and add meta data
+fbxo2 = CreateSeuratObject(counts = exon_mat, project = "Fbxo2",
+                       min.cells = 5, min.features = 500) #keep genes expressed in atlest 5 cells and cells expressing atleast 500 genes
+fbxo2[["percent.mt"]] <- PercentageFeatureSet(fbxo2, pattern = "^mt-")
+
+fbxo2@meta.data[["cell_type"]] = c(rep('WT',180), rep('GAP', 180))
+fbxo2@meta.data[["lib"]] = c(rep('WT_rep1',91), rep('WT_rep2', 89),
+                             rep('GAP_rep1',92), rep('GAP_rep2', 88))
+head(fbxo2@meta.data)
+
+# Plot QC metrics
+VlnPlot(fbxo2, c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol =3, log = T)
+FeatureScatter(fbxo2, feature1 = "nCount_RNA", feature2 = "percent.mt")
+FeatureScatter(fbxo2, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+summary(fbxo2$nCount_RNA)
+summary(fbxo2$nFeature_RNA)
+
+#secondary filtering
+fbxo2 <- subset(fbxo2, subset = nFeature_RNA > 2000 & nFeature_RNA < 6000)
+
+# Normalize and scale
+fbxo2 <- NormalizeData(fbxo2, normalization.method = "LogNormalize", 
+                   scale.factor = 10000)
+
+# Find highly variable genes
+fbxo2 <- FindVariableFeatures(fbxo2, selection.method = "vst", 
+                          nfeatures = 3000)
+VariableFeaturePlot(fbxo2, log = F)
+top10 <- head(VariableFeatures(fbxo2), 10)
+
+
+# Scale all genes and runPCA
+all.genes <- rownames(fbxo2)
+fbxo2 <- ScaleData(fbxo2, features = all.genes)
+fbxo2 <- RunPCA(fbxo2, features = VariableFeatures(object = fbxo2), npcs = 100)
+
+DimPlot(fbxo2, reduction = 'pca', group.by = 'orig.ident')
+DimHeatmap(fbxo2, dims = 1:10)
+
+# Find the optimal number of PCs to using elbow plot and clustree.
+ElbowPlot(fbxo2, ndims = 100)
+
+# clustering at different resolutions
+fbxo2 <- FindNeighbors(fbxo2, dims = 1:25)
+fbxo2 <- FindClusters(fbxo2, resolution = c(0.2,0.4,0.8,1.0,1.2,1.5,1.8,2))
+
+
+fbxo2 <- RunUMAP(fbxo2, dims = 1:25, umap.method = "umap-learn", metric = "correlation")
+
+# plot the clustree to check the degree of clustering at different resolutions
+clustree(fbxo2, key = "RNA_",)
+
+# Pick a resolution and proceed to find markers of the clusters, this step is iterative. Check different resolutions until distinct meaningful clustering of cell types are observed; based on marker genes.
+Idents(fbxo2) <- fbxo2$RNA_snn_res.1.5
+fbxo2_markers <- FindAllMarkers(fbxo2, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Once the clusters have been assigned a cell type, rename the clusters
+cluster_names <- c(
+  "Ctrl 1",
+  "Rprg New SC",
+  "Rprg HC",
+  "Ctrl 2",
+  "Ctrl SC",
+  "Unkwn 1",
+  "Ctrl 3",
+  "Rprg Orig SC",
+  "Unkwn 2"
+)
+names(cluster_names) <- levels(fbxo2)
+fbxo2 <- RenameIdents(fbxo2, cluster_names)
+
+
+# Save the data object as RDS file
+saveRDS(fbxo2, "fbxo2_analysis.RDS")
+
+#Plot the cell embeddings on a UMAP
+DimPlot_scCustom(fbxo2, reduction = 'umap', pt.size = 5, label = F, colors_use = c("chartreuse3", "red", "skyblue", "royalblue", "#DA70D6", "darkgreen", "gold", "grey69", "grey69"), figure_plot = T) & NoAxes()
+
+# Plot heatmap of the top10 marker genes
+fbxo2_markers %>%  group_by(cluster) %>% top_n(n=10, wt = avg_log2FC) -> top10
+DoHeatmap(fbxo2, features = top10$gene, label = F, ) + ggtitle("res: 1.5 | pc's: 25")
+
+# clustered dotplot
+top5_markers <- Extract_Top_Markers(marker_dataframe = fbxo2_markers, num_genes = 5, named_vector = FALSE,
+    make_unique = TRUE)
+Clustered_DotPlot(fbxo2, features = top5_markers, k = 9, colors_use_exp = viridis_dark_high)
+
+# All visualizations such as featureplots, dotplots and violinplots were performed using the plotting functions in the R package scCustomize
+
+```
+

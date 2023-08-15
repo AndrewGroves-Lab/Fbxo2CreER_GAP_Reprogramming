@@ -1,0 +1,201 @@
+---
+title: "Fbxo2CreER_GAP_SCENIC_analysis"
+author: "Ishwar Hosamani"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+All the code needed to performt he scenic analysis on teh Fbxo2CreER x GAP dataset is provided below:
+
+```{r load libraries, echo=FALSE, message=FALSE, warning=FALSE}
+# Suppress loading messages when building the HTML
+suppressPackageStartupMessages({
+  library(SCENIC)
+  library(AUCell)
+  library(RcisTarget)
+  library(SCopeLoomR)
+  library(KernSmooth)
+  library(BiocParallel)
+  library(ggplot2)
+  library(data.table)
+  library(grid)
+  library(ComplexHeatmap)
+  library(dplyr)
+})
+
+options(width=200)
+```
+
+```{r Export the seurat object as a loom file}
+fbxo2_res1.5.loom <- as.loom(fbxo2, filename = "fbxo2_res1.5_pc25.loom")
+fbxo2_res1.5.loom
+fbxo2_res1.5.loom$close_all() #remember to close out the loom file
+```
+
+```{r Extract the expression matrix and cell annotations from the loom file, echo=FALSE}
+### Load data
+loomPath <- ("../../new_fbxo2_analysis/pc25/res_1.5/fbxo2_without_unknown_clusters.loom")
+
+library(SCopeLoomR)
+loom <-  open_loom(loomPath)
+# loom <-  loomR::connect(loomPath)
+exprMat <- get_dgem(loom)
+cellInfo <- get_cell_annotation(loom)
+close_loom(loom)
+
+### Initialize settings
+library(SCENIC)
+defaultDbNames$mgi[1] <- "mm10__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"
+defaultDbNames$mgi[2] <- "mm10__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather"
+defaultDbNames
+
+
+scenicOptions <- initializeScenic(org="mgi", dbDir ="../cisTarget_databases"  , dbs = defaultDbNames[["mgi"]], datasetTitle = "fbx_scenic", nCores=8)
+
+# mgi_dbs <- list("mm10__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather",
+#                 "mm10__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.genes_vs_motifs.rankings.feather")
+# 
+# db_path <- "cisTarget_databases/"
+
+scenicOptions@inputDatasetInfo$cellInfo <- cellInfo
+saveRDS(cellInfo, file="int/cellInfo.Rds")
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+
+```{r Build the co-expression network}
+### Co-expression network
+genesKept <- geneFiltering(exprMat, scenicOptions, minCountsPerGene = 3*.01*ncol(exprMat) , minSamples = ncol(exprMat)*.01 )
+exprMat_filtered <- exprMat[genesKept, ]
+runCorrelation(exprMat_filtered, scenicOptions)
+exprMat_filtered_log <- log2(exprMat_filtered+1) 
+
+set.seed(777)
+runGenie3(exprMat_filtered_log, scenicOptions)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+```{r Build and score the GRN}
+### Build and score the GRN
+exprMat_log <- log2(exprMat+1)
+
+scenicOptions@settings$dbs <- scenicOptions@settings$dbs
+
+scenicOptions <- runSCENIC_1_coexNetwork2modules(scenicOptions)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+scenicOptions <- runSCENIC_2_createRegulons(scenicOptions)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+# coexMethod=c("top5perTarget")) # Toy run settings
+scenicOptions <- runSCENIC_3_scoreCells(scenicOptions, exprMat_log)
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+
+```{r Binarize the AUcell matrix}
+# Optional: Binarize activity
+aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat_log)
+savedSelections <- shiny::runApp(aucellApp)
+newThresholds <- savedSelections$thresholds
+
+scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
+saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+scenicOptions <- runSCENIC_4_aucell_binarize(scenicOptions, exprMat = exprMat_filtered)
+# tsneAUC(scenicOptions, aucType="AUC") # choose settings
+
+# Export:
+# # saveRDS(cellInfo, file=getDatasetInfo(scenicOptions, "cellInfo")) # Temporary, to add to loom
+export2loom(scenicOptions, exprMat_filtered)
+# 
+# # To save the current status, or any changes in settings, save the object again:
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+```
+
+
+```{r Exploring Output}
+# output/Step2_MotifEnrichment_preview.html in detail/subset:
+motifEnrichment_selfMotifs_wGenes <- loadInt(scenicOptions, "motifEnrichment_selfMotifs_wGenes")
+tableSubset <- motifEnrichment_selfMotifs_wGenes[highlightedTFs=="Sox8"]
+viewMotifs(tableSubset) 
+
+# output/Step2_regulonTargetsInfo.tsv in detail: 
+regulonTargetsInfo <- loadInt(scenicOptions, "regulonTargetsInfo")
+tableSubset <- regulonTargetsInfo[TF=="Atoh1" & highConfAnnot==TRUE]
+viewMotifs(tableSubset)
+```
+
+```{r calculate cell type specific regulators}
+# Cell-type specific regulators (RSS): 
+library(plotly)
+regulonAUC <- loadInt(scenicOptions,  "aucell_regulonAUC")
+
+rss <- calcRSS(AUC=getAUC(regulonAUC), cellAnnotation=cellInfo[colnames(regulonAUC), "cluster_names"] )
+rssPlot <- plotRSS(rss, revCol = F)
+plotly::ggplotly(rssPlot$plot)
+```
+
+
+```{r Calculate the Average Regulon Activity by cluster}
+# Average Regulon Activity by cluster
+regulonAUC <- loadInt(scenicOptions, "aucell_regulonAUC")
+regulonAUC <- regulonAUC[onlyNonDuplicatedExtended(rownames(regulonAUC)),]
+regulonActivity_byCellType <- sapply(split(rownames(cellInfo), cellInfo$cell_type),function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+regulonActivity_byClusterName <- sapply(split(rownames(cellInfo), cellInfo$cluster_names),function(cells) rowMeans(getAUC(regulonAUC)[,cells]))
+
+regulonActivity_byClusterName_Scaled <- t(scale(t(regulonActivity_byClusterName), center = T, scale=T))
+ComplexHeatmap::Heatmap(regulonActivity_byClusterName_Scaled, name="Regulon activity")
+```
+
+
+```{r Calculate the binarized regulon activity by celltype and plot heatmaps}
+# Binarized version (~ percentage of cells of that cell type/cluster with the regulon active)
+minPerc <- .7
+
+# Binary regulon activity by cell type
+binaryRegulonActivity <- loadInt(scenicOptions, "aucell_binary_nonDupl")
+cellInfo_binarizedCells <- cellInfo[which(rownames(cellInfo)%in% colnames(binaryRegulonActivity)),, drop=FALSE]
+regulonActivity_byCellType_Binarized <- sapply(split(rownames(cellInfo_binarizedCells), cellInfo_binarizedCells$cluster_names), function(cells)
+  rowMeans(binaryRegulonActivity[, cells, drop = FALSE]))
+binaryActPerc_subset <- regulonActivity_byCellType_Binarized[which(rowSums(regulonActivity_byCellType_Binarized>minPerc)>0),]
+
+
+# plot heatmaps
+png("binary_heatmap_by_cell_type.png", width = 10, height = 15, units = "in", res = 1200)
+ComplexHeatmap::Heatmap(binaryActPerc_subset, name="Regulon activity (%)", col = c("white","pink","red"))
+dev.off()
+
+# Binary regulon activity by cluster names
+regulonActivity_byClusters_Binarized <-
+  sapply(split(rownames(cellInfo_binarizedCells),
+    cellInfo_binarizedCells$cluster_names
+  ), function(cells)
+    rowMeans(binaryRegulonActivity[, cells, drop = FALSE]))
+binaryActPerc_subset_byCluster <-
+  regulonActivity_byClusters_Binarized[which(rowSums(regulonActivity_byClusters_Binarized >
+                                                       minPerc) > 0), ]
+
+# plot heatmaps
+png(
+  "binary_heatmap_by_cluster.png",
+  width = 10,
+  height = 15,
+  units = "in",
+  res = 300
+)
+ComplexHeatmap::Heatmap(
+  binaryActPerc_subset_byCluster,
+  name = "Regulon activity (%)",
+  col = c("white", "pink", "red")
+)
+dev.off()
+
+```
